@@ -26,9 +26,10 @@ import io.javaoperatorsdk.operator.api.config.ControllerConfiguration;
 import io.javaoperatorsdk.operator.api.config.RetryConfiguration;
 import io.javaoperatorsdk.operator.api.config.Utils;
 import io.quarkiverse.operatorsdk.runtime.ConfigurationServiceRecorder;
-import io.quarkiverse.operatorsdk.runtime.ExternalConfiguration;
 import io.quarkiverse.operatorsdk.runtime.ExternalControllerConfiguration;
+import io.quarkiverse.operatorsdk.runtime.OperatorBuildTimeConfiguration;
 import io.quarkiverse.operatorsdk.runtime.OperatorProducer;
+import io.quarkiverse.operatorsdk.runtime.OperatorRunTimeConfiguration;
 import io.quarkiverse.operatorsdk.runtime.QuarkusConfigurationService;
 import io.quarkiverse.operatorsdk.runtime.QuarkusControllerConfiguration;
 import io.quarkiverse.operatorsdk.runtime.Version;
@@ -62,7 +63,8 @@ class OperatorSDKProcessor {
     private static final DotName APPLICATION_SCOPED = DotName
             .createSimple(ApplicationScoped.class.getName());
 
-    private ExternalConfiguration externalConfiguration;
+    private OperatorBuildTimeConfiguration buildTimeConfiguration;
+    private OperatorRunTimeConfiguration runTimeConfiguration;
     private final CRDGenerator generator = new CRDGenerator();
 
     @BuildStep
@@ -75,11 +77,10 @@ class OperatorSDKProcessor {
     }
 
     @BuildStep
-    @Record(ExecutionTime.STATIC_INIT)
-    void createConfigurationServiceAndOperator(
-            OutputTargetBuildItem outputTarget,
+    @Record(ExecutionTime.RUNTIME_INIT)
+    void createControllerConfigurations(
+            QuarkusConfigurationService service,
             CombinedIndexBuildItem combinedIndexBuildItem,
-            BuildProducer<SyntheticBeanBuildItem> syntheticBeanBuildItemBuildProducer,
             BuildProducer<AdditionalBeanBuildItem> additionalBeans,
             BuildProducer<ReflectiveClassBuildItem> reflectionClasses,
             ConfigurationServiceRecorder recorder) {
@@ -91,8 +92,19 @@ class OperatorSDKProcessor {
                 .map(ci -> createControllerConfiguration(ci, additionalBeans, reflectionClasses, index))
                 .collect(Collectors.toList());
 
+        recorder.registerControllerConfigurations(service, controllerConfigs);
+    }
+
+    @BuildStep
+    @Record(ExecutionTime.STATIC_INIT)
+    void createConfigurationServiceAndOperator(
+            OutputTargetBuildItem outputTarget,
+            BuildProducer<SyntheticBeanBuildItem> syntheticBeanBuildItemBuildProducer,
+            BuildProducer<AdditionalBeanBuildItem> additionalBeans,
+            ConfigurationServiceRecorder recorder) {
+
         // generate CRDs
-        final var outputDir = outputTarget.getOutputDirectory().resolve(externalConfiguration.crdOutputDirectory).toFile();
+        final var outputDir = outputTarget.getOutputDirectory().resolve(buildTimeConfiguration.crdOutputDirectory).toFile();
         if (!outputDir.exists()) {
             outputDir.mkdirs();
         }
@@ -101,11 +113,10 @@ class OperatorSDKProcessor {
         final var version = Utils.loadFromProperties();
         final var validateCustomResources = Utils.isValidateCustomResourcesEnvVarSet()
                 ? Utils.shouldCheckCRDAndValidateLocalModel()
-                : externalConfiguration.checkCRDAndValidateLocalModel.orElse(true);
+                : buildTimeConfiguration.checkCRDAndValidateLocalModel.orElse(true);
 
         final var supplier = recorder.configurationServiceSupplier(
                 new Version(version.getSdkVersion(), version.getCommit(), version.getBuiltTime()),
-                controllerConfigs,
                 validateCustomResources);
         syntheticBeanBuildItemBuildProducer.produce(
                 SyntheticBeanBuildItem.configure(QuarkusConfigurationService.class)
@@ -135,7 +146,7 @@ class OperatorSDKProcessor {
 
             // extract the configuration from annotation and/or external configuration
             final var configExtractor = new HybridControllerConfiguration(
-                    controllerClassName, externalConfiguration, info);
+                    controllerClassName, runTimeConfiguration, info);
 
             if (configExtractor.delayedRegistration()) {
                 ObserverConfigurator configurator = observerRegistrationPhase
@@ -230,8 +241,7 @@ class OperatorSDKProcessor {
 
         // extract the configuration from annotation and/or external configuration
         final var configExtractor = new HybridControllerConfiguration(resourceControllerClassName,
-                externalConfiguration,
-                info);
+                runTimeConfiguration, info);
 
         // create the configuration
         final var name = configExtractor.name();
