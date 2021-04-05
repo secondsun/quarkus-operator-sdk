@@ -4,6 +4,7 @@ import java.lang.annotation.Annotation;
 import java.lang.reflect.Modifier;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import javax.enterprise.context.ApplicationScoped;
@@ -11,26 +12,29 @@ import javax.enterprise.inject.Instance;
 import javax.enterprise.inject.spi.CDI;
 import javax.inject.Singleton;
 
+import org.jboss.jandex.AnnotationInstance;
+import org.jboss.jandex.AnnotationValue;
 import org.jboss.jandex.ClassInfo;
 import org.jboss.jandex.DotName;
 import org.jboss.jandex.IndexView;
 import org.jboss.logging.Logger;
 
-import io.fabric8.crd.generator.CRDGenerator;
-import io.fabric8.crd.generator.CustomResourceInfo;
+import io.fabric8.kubernetes.api.model.HasMetadata;
 import io.fabric8.kubernetes.client.CustomResource;
+import io.javaoperatorsdk.operator.ControllerUtils;
 import io.javaoperatorsdk.operator.Operator;
+import io.javaoperatorsdk.operator.api.Controller;
 import io.javaoperatorsdk.operator.api.ResourceController;
 import io.javaoperatorsdk.operator.api.config.ConfigurationService;
 import io.javaoperatorsdk.operator.api.config.ControllerConfiguration;
-import io.javaoperatorsdk.operator.api.config.RetryConfiguration;
 import io.javaoperatorsdk.operator.api.config.Utils;
+import io.quarkiverse.operatorsdk.runtime.BuildTimeOperatorConfiguration;
 import io.quarkiverse.operatorsdk.runtime.ConfigurationServiceRecorder;
-import io.quarkiverse.operatorsdk.runtime.ExternalConfiguration;
-import io.quarkiverse.operatorsdk.runtime.ExternalControllerConfiguration;
+import io.quarkiverse.operatorsdk.runtime.DelayRegistrationUntil;
 import io.quarkiverse.operatorsdk.runtime.OperatorProducer;
 import io.quarkiverse.operatorsdk.runtime.QuarkusConfigurationService;
 import io.quarkiverse.operatorsdk.runtime.QuarkusControllerConfiguration;
+import io.quarkiverse.operatorsdk.runtime.RunTimeOperatorConfiguration;
 import io.quarkiverse.operatorsdk.runtime.Version;
 import io.quarkus.arc.deployment.AdditionalBeanBuildItem;
 import io.quarkus.arc.deployment.ObserverRegistrationPhaseBuildItem;
@@ -61,9 +65,14 @@ class OperatorSDKProcessor {
 
     private static final DotName APPLICATION_SCOPED = DotName
             .createSimple(ApplicationScoped.class.getName());
+    private static final DotName CUSTOM_RESOURCE = DotName.createSimple(CustomResource.class.getName());
+    private static final DotName CONTROLLER = DotName.createSimple(Controller.class.getName());
+    private static final DotName DELAY_REGISTRATION = DotName.createSimple(DelayRegistrationUntil.class.getName());
 
-    private ExternalConfiguration externalConfiguration;
-    private final CRDGenerator generator = new CRDGenerator();
+    private BuildTimeOperatorConfiguration buildTimeConfiguration;
+
+    // todo: reactivate when CRD generation from API works properly
+    //    private final CRDGenerator generator = new CRDGenerator();
 
     @BuildStep
     void indexSDKDependencies(
@@ -75,33 +84,47 @@ class OperatorSDKProcessor {
     }
 
     @BuildStep
+    @Record(ExecutionTime.RUNTIME_INIT)
+    void updateControllerConfigurations(
+            ConfigurationServiceRecorder recorder,
+            RunTimeOperatorConfiguration runTimeConfiguration,
+            ConfigurationServiceBuildItem serviceBuildItem) {
+        recorder.updateConfigurations(serviceBuildItem.getConfigurationService(), runTimeConfiguration);
+    }
+
+    @BuildStep
     @Record(ExecutionTime.STATIC_INIT)
-    void createConfigurationServiceAndOperator(
+    ConfigurationServiceBuildItem createConfigurationServiceAndOperator(
             OutputTargetBuildItem outputTarget,
             CombinedIndexBuildItem combinedIndexBuildItem,
             BuildProducer<SyntheticBeanBuildItem> syntheticBeanBuildItemBuildProducer,
             BuildProducer<AdditionalBeanBuildItem> additionalBeans,
             BuildProducer<ReflectiveClassBuildItem> reflectionClasses,
             ConfigurationServiceRecorder recorder) {
+
+        // todo: reactivate when CRD generation from API works properly
+        /*
+         * // generate CRDs
+         * final var outputDir = outputTarget.getOutputDirectory().resolve(externalConfiguration.crdOutputDirectory).toFile();
+         * if (!outputDir.exists()) {
+         * outputDir.mkdirs();
+         * }
+         * generator.inOutputDir(outputDir).generate();
+         */
+
+        final var version = Utils.loadFromProperties();
+        final var validateCustomResources = Utils.isValidateCustomResourcesEnvVarSet()
+                ? Utils.shouldCheckCRDAndValidateLocalModel()
+                : buildTimeConfiguration.checkCRDAndValidateLocalModel.orElse(true);
+
         final var index = combinedIndexBuildItem.getIndex();
         final var resourceControllers = index.getAllKnownImplementors(RESOURCE_CONTROLLER);
 
         final List<ControllerConfiguration> controllerConfigs = resourceControllers.stream()
                 .filter(ci -> !Modifier.isAbstract(ci.flags()))
-                .map(ci -> createControllerConfiguration(ci, additionalBeans, reflectionClasses, index))
+                .map(ci -> createControllerConfiguration(ci, additionalBeans, reflectionClasses,
+                        index))
                 .collect(Collectors.toList());
-
-        // generate CRDs
-        final var outputDir = outputTarget.getOutputDirectory().resolve(externalConfiguration.crdOutputDirectory).toFile();
-        if (!outputDir.exists()) {
-            outputDir.mkdirs();
-        }
-        generator.inOutputDir(outputDir).generate();
-
-        final var version = Utils.loadFromProperties();
-        final var validateCustomResources = Utils.isValidateCustomResourcesEnvVarSet()
-                ? Utils.shouldCheckCRDAndValidateLocalModel()
-                : externalConfiguration.checkCRDAndValidateLocalModel.orElse(true);
 
         final var supplier = recorder.configurationServiceSupplier(
                 new Version(version.getSdkVersion(), version.getCommit(), version.getBuiltTime()),
@@ -111,11 +134,12 @@ class OperatorSDKProcessor {
                 SyntheticBeanBuildItem.configure(QuarkusConfigurationService.class)
                         .scope(Singleton.class)
                         .addType(ConfigurationService.class)
-                        .setRuntimeInit()
+                        // todo:                       .setRuntimeInit()
                         .supplier(supplier)
                         .done());
 
         additionalBeans.produce(AdditionalBeanBuildItem.unremovableOf(OperatorProducer.class));
+        return new ConfigurationServiceBuildItem(supplier);
     }
 
     /**
@@ -133,9 +157,13 @@ class OperatorSDKProcessor {
         for (ClassInfo info : index.getAllKnownImplementors(RESOURCE_CONTROLLER)) {
             final var controllerClassName = info.name().toString();
 
+            final var controllerAnnotation = info.classAnnotation(CONTROLLER);
+            final var name = getControllerName(controllerClassName,
+                    controllerAnnotation);
+
             // extract the configuration from annotation and/or external configuration
-            final var configExtractor = new HybridControllerConfiguration(
-                    controllerClassName, externalConfiguration, info);
+            final var configExtractor = new BuildTimeHybridControllerConfiguration(buildTimeConfiguration.controllers.get(name),
+                    controllerAnnotation, info.classAnnotation(DELAY_REGISTRATION));
 
             if (configExtractor.delayedRegistration()) {
                 ObserverConfigurator configurator = observerRegistrationPhase
@@ -207,16 +235,9 @@ class OperatorSDKProcessor {
         // load CR class
         final Class<CustomResource> crClass = (Class<CustomResource>) loadClass(crType);
 
+        // todo: reactivate when CRD generation from API works properly
         // process the CR to generate the CRD
-        generator.customResources(CustomResourceInfo.fromClass(crClass));
-
-        // Instantiate CR to check that it's properly annotated
-        final CustomResource cr;
-        try {
-            cr = crClass.getConstructor().newInstance();
-        } catch (Exception e) {
-            throw new IllegalArgumentException("Cannot instantiate '" + crType + "' CR class", e);
-        }
+        //        generator.customResources(CustomResourceInfo.fromClass(crClass));
 
         // retrieve CRD name from CR type
         final var crdName = CustomResource.getCRDName(crClass);
@@ -225,49 +246,69 @@ class OperatorSDKProcessor {
         reflectionClasses.produce(new ReflectiveClassBuildItem(true, true, crType));
 
         // register spec and status for introspection
-        registerForReflection(reflectionClasses, cr.getSpec());
-        registerForReflection(reflectionClasses, cr.getStatus());
+        final var crParamTypes = JandexUtil
+                .resolveTypeParameters(DotName.createSimple(crType), CUSTOM_RESOURCE, index);
+        registerForReflection(reflectionClasses, crParamTypes.get(0).name().toString());
+        registerForReflection(reflectionClasses, crParamTypes.get(1).name().toString());
 
         // extract the configuration from annotation and/or external configuration
-        final var configExtractor = new HybridControllerConfiguration(resourceControllerClassName,
-                externalConfiguration,
-                info);
+        final var controllerAnnotation = info.classAnnotation(CONTROLLER);
+        final var delayedRegistrationAnnotation = info.classAnnotation(DELAY_REGISTRATION);
 
-        // create the configuration
-        final var name = configExtractor.name();
+        // retrieve the controller's name
+        final String name = getControllerName(resourceControllerClassName, controllerAnnotation);
+
+        final var configExtractor = new BuildTimeHybridControllerConfiguration(buildTimeConfiguration.controllers.get(name),
+                controllerAnnotation, delayedRegistrationAnnotation);
 
         // create the configuration
         final var configuration = new QuarkusControllerConfiguration(
                 resourceControllerClassName,
                 name,
                 crdName,
-                configExtractor.finalizer(crdName),
                 configExtractor.generationAware(),
-                QuarkusControllerConfiguration.asSet(configExtractor.namespaces()),
                 crType,
-                configExtractor.retryConfiguration(),
-                configExtractor.delayedRegistration());
+                configExtractor.delayedRegistration(),
+                getNamespaces(controllerAnnotation),
+                getFinalizer(controllerAnnotation, crdName));
 
         log.infov(
                 "Processed ''{0}'' controller named ''{1}'' for ''{2}'' CR (version ''{3}'')",
-                info.name().toString(), name, cr.getCRDName(), cr.getApiVersion());
+                info.name().toString(), name, crdName, HasMetadata.getApiVersion(crClass));
 
         return configuration;
     }
 
+    private String getControllerName(String resourceControllerClassName, AnnotationInstance controllerAnnotation) {
+        final var defaultControllerName = ControllerUtils.getDefaultResourceControllerName(resourceControllerClassName);
+        return ValueExtractor.annotationValueOrDefault(
+                controllerAnnotation, "name", AnnotationValue::asString, () -> defaultControllerName);
+    }
+
+    private Set<String> getNamespaces(AnnotationInstance controllerAnnotation) {
+        return QuarkusControllerConfiguration.asSet(ValueExtractor.annotationValueOrDefault(
+                controllerAnnotation,
+                "namespaces",
+                AnnotationValue::asStringArray,
+                () -> new String[] {}));
+    }
+
+    private String getFinalizer(AnnotationInstance controllerAnnotation, String crdName) {
+        return ValueExtractor.annotationValueOrDefault(controllerAnnotation,
+                "finalizerName",
+                AnnotationValue::asString,
+                () -> ControllerUtils.getDefaultFinalizerName(crdName));
+    }
+
     private void registerForReflection(
-            BuildProducer<ReflectiveClassBuildItem> reflectionClasses, Object specOrStatus) {
-        Optional.ofNullable(specOrStatus)
-                .map(s -> specOrStatus.getClass().getCanonicalName())
+            BuildProducer<ReflectiveClassBuildItem> reflectionClasses, String className) {
+        Optional.ofNullable(className)
+                .filter(s -> !Void.TYPE.getName().equals(className))
                 .ifPresent(
                         cn -> {
                             reflectionClasses.produce(new ReflectiveClassBuildItem(true, true, cn));
-                            System.out.println("Registered " + cn);
+                            log.infov("Registered ''{0}'' for reflection", cn);
                         });
-    }
-
-    private RetryConfiguration retryConfiguration(ExternalControllerConfiguration extConfig) {
-        return extConfig == null ? null : RetryConfigurationResolver.resolve(extConfig.retry);
     }
 
     private Class<?> loadClass(String className) {

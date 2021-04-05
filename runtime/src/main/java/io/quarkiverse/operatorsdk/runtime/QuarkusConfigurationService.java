@@ -1,6 +1,7 @@
 package io.quarkiverse.operatorsdk.runtime;
 
 import java.util.List;
+import java.util.stream.Stream;
 
 import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.CustomResource;
@@ -50,5 +51,26 @@ public class QuarkusConfigurationService extends AbstractConfigurationService {
     private static <R extends CustomResource> ResourceController<R> unwrap(
             ResourceController<R> controller) {
         return (ResourceController<R>) unwrapper.apply(controller);
+    }
+
+    @Override
+    protected String keyFor(ResourceController controller) {
+        String controllerName = super.keyFor(controller);
+        // heuristics: we're assuming that any class name with an '_' in it is a
+        // proxy / wrapped / generated class and that the "real" class name is located before the
+        // '_'. This probably won't work in all instances but should work most of the time.
+        final int i = controllerName.indexOf('_');
+        if (i > 0) {
+            controllerName = controllerName.substring(0, i);
+        }
+        return controllerName;
+    }
+
+    public Stream<QuarkusControllerConfiguration> configurations() {
+        return controllerConfigurations().map(c -> (QuarkusControllerConfiguration) c);
+    }
+
+    public void updateConfiguration(QuarkusControllerConfiguration configuration) {
+        replace(configuration);
     }
 }
